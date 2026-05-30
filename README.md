@@ -1,2 +1,3 @@
-# batcrm-api
-ScrumDev AI backend (batcrm-api)
+# BATCRM - Backend
+
+FastAPI desplegado en Render.
