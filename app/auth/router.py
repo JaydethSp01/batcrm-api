@@ -1,127 +1,125 @@
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
-import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+ROUTER_PREFIX = "/api/v1/auth"
+SECRET_KEY = "change-me-in-env-batcrm-secret"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 15
 
-JWT_SECRET = "change-me-in-env"
-JWT_ALG = "HS256"
-ACCESS_TOKEN_TTL_MIN = 60
+Role = Literal["seller", "manager"]
 
-pwd_ctx = CryptContext(schemes=["argon2"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
-
-Role = Literal["vendedor", "gerente"]
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{ROUTER_PREFIX}/login")
+router = APIRouter(prefix=ROUTER_PREFIX, tags=["auth"])
 
 
 class LoginRequest(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=6, max_length=128)
+    password: str
 
 
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     role: Role
+    expires_in: int
     redirect_to: str
 
 
 class UserPublic(BaseModel):
     id: int
     email: EmailStr
+    full_name: str
     role: Role
 
 
-# Repositorio en memoria (sustituir por SQLAlchemy en S-003).
-USERS_DB: dict[str, dict] = {
-    "vendedor@batcrm.com": {
+# Repositorio en memoria (placeholder hasta integrar SQLAlchemy + Alembic)
+_FAKE_USERS_DB: dict[str, dict] = {
+    "seller@batcrm.com": {
         "id": 1,
-        "email": "vendedor@batcrm.com",
-        "role": "vendedor",
-        "password_hash": pwd_ctx.hash("vendedor123"),
+        "email": "seller@batcrm.com",
+        "full_name": "Vendedor Demo",
+        "role": "seller",
+        "hashed_password": pwd_context.hash("seller123"),
     },
-    "gerente@batcrm.com": {
+    "manager@batcrm.com": {
         "id": 2,
-        "email": "gerente@batcrm.com",
-        "role": "gerente",
-        "password_hash": pwd_ctx.hash("gerente123"),
+        "email": "manager@batcrm.com",
+        "full_name": "Gerente Demo",
+        "role": "manager",
+        "hashed_password": pwd_context.hash("manager123"),
     },
 }
 
-REVOKED_TOKENS: set[str] = set()
+
+def _authenticate(email: str, password: str) -> Optional[dict]:
+    user = _FAKE_USERS_DB.get(email.lower())
+    if not user or not pwd_context.verify(password, user["hashed_password"]):
+        return None
+    return user
 
 
-def _create_access_token(sub: str, role: Role) -> str:
-    now = datetime.now(tz=timezone.utc)
-    payload = {
-        "sub": sub,
-        "role": role,
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(minutes=ACCESS_TOKEN_TTL_MIN)).timestamp()),
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
-
-
-def _redirect_for_role(role: Role) -> str:
-    return "/dashboard/gerente" if role == "gerente" else "/dashboard/vendedor"
+def _create_access_token(sub: str, role: Role, user_id: int) -> tuple[str, int]:
+    expires_delta = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.now(timezone.utc) + expires_delta
+    payload = {"sub": sub, "role": role, "uid": user_id, "exp": expire}
+    token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    return token, int(expires_delta.total_seconds())
 
 
 def get_current_user(token: str = Depends(oauth2_scheme)) -> UserPublic:
-    if token in REVOKED_TOKENS:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Sesion invalidada")
+    credentials_exc = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Token invalido o expirado",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token expirado")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token invalido")
-    user = USERS_DB.get(payload.get("sub", ""))
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        role = payload.get("role")
+        uid = payload.get("uid")
+        if not email or role not in ("seller", "manager") or uid is None:
+            raise credentials_exc
+    except JWTError as exc:
+        raise credentials_exc from exc
+    user = _FAKE_USERS_DB.get(email)
     if not user:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Usuario inexistente")
-    return UserPublic(id=user["id"], email=user["email"], role=user["role"])
+        raise credentials_exc
+    return UserPublic(**{k: user[k] for k in ("id", "email", "full_name", "role")})
 
 
-def require_role(*allowed: Role):
-    def _checker(user: UserPublic = Depends(get_current_user)) -> UserPublic:
-        if user.role not in allowed:
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                detail={"message": "Acceso denegado", "redirect_to": "/403"},
-            )
-        return user
+def require_role(*roles: Role):
+    def _checker(current: UserPublic = Depends(get_current_user)) -> UserPublic:
+        if current.role not in roles:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Rol no autorizado")
+        return current
     return _checker
 
 
 @router.post("/login", response_model=TokenResponse)
 def login(payload: LoginRequest) -> TokenResponse:
-    user = USERS_DB.get(payload.email.lower())
-    if not user or not pwd_ctx.verify(payload.password, user["password_hash"]):
+    user = _authenticate(payload.email, payload.password)
+    if not user:
         raise HTTPException(
-            status.HTTP_401_UNAUTHORIZED, detail="Credenciales incorrectas"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales invalidas",
         )
-    token = _create_access_token(user["email"], user["role"])
+    token, expires_in = _create_access_token(user["email"], user["role"], user["id"])
+    redirect = "/dashboard/manager" if user["role"] == "manager" else "/dashboard/seller"
     return TokenResponse(
         access_token=token,
         role=user["role"],
-        redirect_to=_redirect_for_role(user["role"]),
+        expires_in=expires_in,
+        redirect_to=redirect,
     )
 
 
-@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
-def logout(token: str = Depends(oauth2_scheme)) -> None:
-    REVOKED_TOKENS.add(token)
-
-
 @router.get("/me", response_model=UserPublic)
-def me(user: UserPublic = Depends(get_current_user)) -> UserPublic:
-    return user
-
-
-@router.get("/manager-area", response_model=UserPublic)
-def manager_area(user: UserPublic = Depends(require_role("gerente"))) -> UserPublic:
-    return user
+def me(current: UserPublic = Depends(get_current_user)) -> UserPublic:
+    return current
